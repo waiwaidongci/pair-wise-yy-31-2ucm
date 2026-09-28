@@ -10,7 +10,7 @@ import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 DB_PATH = Path(__file__).with_name("data.db")
 
@@ -75,6 +75,25 @@ class Store:
           UNIQUE(recall_id,vehicle_id,idempotency_key)
         );
         CREATE UNIQUE INDEX IF NOT EXISTS one_confirmed_repair ON repairs(recall_id,vehicle_id) WHERE status='confirmed';
+        CREATE TABLE IF NOT EXISTS repair_appeals (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          repair_id INTEGER NOT NULL REFERENCES repairs(id),
+          recall_id INTEGER NOT NULL, vehicle_id INTEGER NOT NULL, dealer_id INTEGER NOT NULL,
+          new_evidence_hash TEXT NOT NULL, explanation TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('pending','upheld','overturned')),
+          submitted_by TEXT NOT NULL, submitted_at TEXT NOT NULL,
+          decided_by TEXT, decided_at TEXT, decision_note TEXT, gap_id INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS one_pending_appeal ON repair_appeals(repair_id) WHERE status='pending';
+        CREATE TABLE IF NOT EXISTS part_gaps (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          recall_id INTEGER NOT NULL REFERENCES recalls(id),
+          dealer_id INTEGER NOT NULL REFERENCES dealers(id), remedy_version INTEGER NOT NULL,
+          repair_id INTEGER NOT NULL REFERENCES repairs(id), appeal_id INTEGER NOT NULL REFERENCES repair_appeals(id),
+          quantity INTEGER NOT NULL CHECK(quantity>=0), original_quantity INTEGER NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('open','recovered')),
+          created_by TEXT NOT NULL, created_at TEXT NOT NULL, recovered_at TEXT
+        );
         CREATE TABLE IF NOT EXISTS notifications (
           id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
           vehicle_id INTEGER NOT NULL REFERENCES vehicles(id), scope_version INTEGER NOT NULL,
@@ -215,13 +234,19 @@ class RecallService:
         if quantity <= 0: raise ApiError(400, "入库数量必须大于零")
         recall = self._row("recalls", recall_id); dealer = self._row("dealers", dealer_id)
         if recall["state"] not in {"published", "submitted"}: raise ApiError(409, "召回尚未进入可备件状态")
+        stamp = now()
         with self.conn:
-            self.conn.execute("""INSERT INTO parts(recall_id,dealer_id,remedy_version,available) VALUES(?,?,?,?)
-                               ON CONFLICT(recall_id,dealer_id,remedy_version) DO UPDATE SET available=available+excluded.available""",
-                              (recall_id, dealer_id, remedy_version, quantity))
-            self.store.audit(actor, "parts.add", "recall", recall_id, {"dealer_id": dealer_id, "quantity": quantity, "remedy_version": remedy_version})
+            leftover, recovered = self._fill_gaps_with_restock(recall_id, dealer_id, remedy_version, quantity, actor, stamp)
+            if leftover > 0:
+                self.conn.execute("""INSERT INTO parts(recall_id,dealer_id,remedy_version,available) VALUES(?,?,?,?)
+                                   ON CONFLICT(recall_id,dealer_id,remedy_version) DO UPDATE SET available=available+excluded.available""",
+                                  (recall_id, dealer_id, remedy_version, leftover))
+            self.store.audit(actor, "parts.add", "recall", recall_id,
+                             {"dealer_id": dealer_id, "quantity": quantity, "remedy_version": remedy_version,
+                              "filled_gaps": quantity - leftover, "recovered_gap_ids": [g["id"] for g in recovered]})
         row = self.conn.execute("SELECT * FROM parts WHERE recall_id=? AND dealer_id=? AND remedy_version=?", (recall_id, dealer_id, remedy_version)).fetchone()
-        return dict(row)
+        return {"part": dict(row) if row else None, "filled_gap_quantity": quantity - leftover,
+                "recovered_gaps": recovered, "dealer_suspended": self._dealer_suspended(dealer_id)}
 
     def report_repair(self, actor: str | None, role: str | None, recall_id: int, vin: str, dealer_id: int, remedy_version: int, evidence_hash: str, evidence_consistent: bool, border_permit: str = "", idempotency_key: str = "") -> dict:
         actor = self._actor(actor, role, {"dealer"})
@@ -234,6 +259,7 @@ class RecallService:
         if not dealer["active"]: raise ApiError(409, "维修网点已停用")
         existing = self.conn.execute("SELECT * FROM repairs WHERE recall_id=? AND vehicle_id=? AND idempotency_key=?", (recall_id, vehicle["id"], idempotency_key)).fetchone()
         if existing: return dict(existing)
+        if self._dealer_suspended(dealer_id): raise ApiError(409, "网点存在未补齐的库存缺口，已暂停新维修，补货后自动恢复")
         duplicate = self.conn.execute("SELECT id FROM repairs WHERE recall_id=? AND vehicle_id=? AND status IN ('reported','confirmed')", (recall_id, vehicle["id"])).fetchone()
         if duplicate: raise ApiError(409, "该车辆已有维修记录")
         scope = json.loads(recall["scope_json"])
@@ -264,6 +290,154 @@ class RecallService:
                                   (repair["recall_id"], repair["dealer_id"], repair["remedy_version"]))
             self.store.audit(actor, "repair.review", "repair", repair_id, {"decision": decision, "status": new_status, "note": note})
         return dict(self._row("repairs", repair_id))
+
+    def submit_appeal(self, actor: str | None, role: str | None, repair_id: int, new_evidence_hash: str, explanation: str) -> dict:
+        actor = self._actor(actor, role, {"dealer"})
+        if not new_evidence_hash: raise ApiError(400, "新证据哈希不能为空")
+        if not explanation.strip(): raise ApiError(400, "申诉说明不能为空")
+        repair = self._row("repairs", repair_id)
+        if repair["reported_by"] != actor: raise ApiError(403, "只能对本网点提交的维修单发起申诉")
+        if repair["status"] != "flagged": raise ApiError(409, "只有监管打回的维修单可以申诉")
+        pending = self.conn.execute("SELECT id FROM repair_appeals WHERE repair_id=? AND status='pending'", (repair_id,)).fetchone()
+        if pending: raise ApiError(409, "该维修单已有待审申诉")
+        conflict = self.conn.execute("SELECT id FROM repairs WHERE recall_id=? AND vehicle_id=? AND status='confirmed' AND id<>?",
+                                     (repair["recall_id"], repair["vehicle_id"], repair_id)).fetchone()
+        if conflict: raise ApiError(409, "该车辆已有恢复完成的维修记录，无需申诉")
+        stamp = now()
+        try:
+            with self.conn:
+                cur = self.conn.execute("""INSERT INTO repair_appeals(repair_id,recall_id,vehicle_id,dealer_id,new_evidence_hash,explanation,status,submitted_by,submitted_at)
+                                         VALUES(?,?,?,?,?,?, 'pending',?,?)""",
+                                        (repair_id, repair["recall_id"], repair["vehicle_id"], repair["dealer_id"], new_evidence_hash, explanation.strip(), actor, stamp))
+                self.store.audit(actor, "appeal.submit", "repair_appeal", cur.lastrowid,
+                                 {"repair_id": repair_id, "new_evidence_hash": new_evidence_hash})
+        except sqlite3.IntegrityError as exc:
+            raise ApiError(409, "该维修单已有待审申诉") from exc
+        return self._appeal_dict(self._row("repair_appeals", cur.lastrowid))
+
+    def decide_appeal(self, actor: str | None, role: str | None, appeal_id: int, decision: str, note: str = "") -> dict:
+        actor = self._actor(actor, role, {"regulator"})
+        if decision not in {"uphold", "overturn"}: raise ApiError(400, "决定只能是 uphold 或 overturn")
+        appeal = self._row("repair_appeals", appeal_id)
+        if appeal["status"] != "pending": raise ApiError(409, "申诉已经判定")
+        repair = self._row("repairs", appeal["repair_id"])
+        stamp = now()
+        auto_uphold = ""
+        with self.conn:
+            if decision == "uphold":
+                gap_id = None
+                cur = self.conn.execute("UPDATE repair_appeals SET status='upheld',decided_by=?,decided_at=?,decision_note=? WHERE id=? AND status='pending'",
+                                        (actor, stamp, note, appeal_id))
+                if cur.rowcount != 1: raise ApiError(409, "申诉已被处理，请刷新")
+            else:
+                conflict = self.conn.execute("SELECT id FROM repairs WHERE recall_id=? AND vehicle_id=? AND status='confirmed' AND id<>?",
+                                             (repair["recall_id"], repair["vehicle_id"], repair["id"])).fetchone()
+                if repair["status"] != "flagged" or conflict:
+                    auto_uphold = "该车辆已有新的完成维修，申诉自动维持打回" if conflict else "原维修单当前不可恢复，申诉自动维持打回"
+                    self.conn.execute("UPDATE repair_appeals SET status='upheld',decided_by=?,decided_at=?,decision_note=? WHERE id=? AND status='pending'",
+                                      (actor, stamp, auto_uphold, appeal_id))
+                    gap_id = None
+                else:
+                    gap_id = self._restore_repair(repair, appeal, actor, stamp)
+                    cur = self.conn.execute("UPDATE repairs SET status='confirmed' WHERE id=? AND status='flagged'", (repair["id"],))
+                    if cur.rowcount != 1: raise ApiError(409, "原维修单状态已变化，无法恢复")
+                    cur = self.conn.execute("UPDATE repair_appeals SET status='overturned',decided_by=?,decided_at=?,decision_note=?,gap_id=? WHERE id=? AND status='pending'",
+                                            (actor, stamp, note, gap_id, appeal_id))
+                    if cur.rowcount != 1: raise ApiError(409, "申诉已被处理，请刷新")
+            self.store.audit(actor, "appeal.decide", "repair_appeal", appeal_id,
+                             {"decision": "uphold" if auto_uphold else decision, "repair_id": repair["id"], "note": note, "gap_id": gap_id})
+        if auto_uphold: raise ApiError(409, auto_uphold)
+        return self._appeal_dict(self._row("repair_appeals", appeal_id))
+
+    def _restore_repair(self, repair: sqlite3.Row, appeal: sqlite3.Row, actor: str, stamp: str) -> int | None:
+        """恢复打回维修：优先从当前库存扣回；退回零件已被其他车辆领走则登记库存缺口。返回 gap_id。"""
+        part = self.conn.execute("SELECT * FROM parts WHERE recall_id=? AND dealer_id=? AND remedy_version=?",
+                                 (repair["recall_id"], repair["dealer_id"], repair["remedy_version"])).fetchone()
+        if part and int(part["available"]) >= 1:
+            self.conn.execute("UPDATE parts SET available=available-1 WHERE id=?", (part["id"],))
+            return None
+        gap_cur = self.conn.execute("""INSERT INTO part_gaps(recall_id,dealer_id,remedy_version,repair_id,appeal_id,quantity,original_quantity,status,created_by,created_at)
+                                     VALUES(?,?,?,?,?, 1, 1, 'open',?,?)""",
+                                    (repair["recall_id"], repair["dealer_id"], repair["remedy_version"], repair["id"], appeal["id"], actor, stamp))
+        self.store.audit(actor, "parts.gap_open", "part_gap", gap_cur.lastrowid,
+                         {"repair_id": repair["id"], "dealer_id": repair["dealer_id"]})
+        return int(gap_cur.lastrowid)
+
+    def _fill_gaps_with_restock(self, recall_id: int, dealer_id: int, remedy_version: int, quantity: int, actor: str, stamp: str) -> tuple[int, list[dict]]:
+        """补货优先冲抵同物料的待补缺口（按登记先后）；返回 (入可用库存的余量, 本次补齐的缺口)。"""
+        recovered = []
+        rows = self.conn.execute("""SELECT * FROM part_gaps WHERE recall_id=? AND dealer_id=? AND remedy_version=? AND status='open'
+                                    ORDER BY id""", (recall_id, dealer_id, remedy_version)).fetchall()
+        for gap in rows:
+            if quantity <= 0: break
+            take = min(quantity, int(gap["quantity"]))
+            quantity -= take
+            remaining = int(gap["quantity"]) - take
+            if remaining > 0:
+                self.conn.execute("UPDATE part_gaps SET quantity=? WHERE id=?", (remaining, gap["id"]))
+            else:
+                self.conn.execute("UPDATE part_gaps SET quantity=0,status='recovered',recovered_at=? WHERE id=?", (stamp, gap["id"]))
+                recovered.append({"id": gap["id"], "repair_id": gap["repair_id"], "appeal_id": gap["appeal_id"]})
+                self.store.audit(actor, "parts.gap_recovered", "part_gap", gap["id"], {"repair_id": gap["repair_id"]})
+        return quantity, recovered
+
+    def _dealer_suspended(self, dealer_id: int) -> bool:
+        return self.conn.execute("SELECT 1 FROM part_gaps WHERE dealer_id=? AND status='open' LIMIT 1", (dealer_id,)).fetchone() is not None
+
+    def appeals_archive(self, actor: str | None, role: str | None, status_filter: str = "") -> dict:
+        if not actor: raise ApiError(401, "缺少身份")
+        if role not in {"regulator", "dealer", "manufacturer"}: raise ApiError(403, "角色无权查看申诉档案")
+        groups = {"pending": [], "upheld": [], "overturned": []}
+        sql = "SELECT * FROM repair_appeals"
+        params: tuple = ()
+        if status_filter:
+            if status_filter not in groups: raise ApiError(400, "状态只能是 pending、upheld 或 overturned")
+            sql += " WHERE status=?"; params = (status_filter,)
+        sql += " ORDER BY id"
+        for row in self.conn.execute(sql, params):
+            groups[row["status"]].append(self._appeal_dict(row))
+        return {"pending": groups["pending"], "upheld": groups["upheld"], "overturned": groups["overturned"],
+                "inventory": self._inventory_status()}
+
+    def _appeal_dict(self, row: sqlite3.Row) -> dict:
+        repair = self._row("repairs", row["repair_id"])
+        vehicle = self._row("vehicles", repair["vehicle_id"])
+        dealer = self._row("dealers", repair["dealer_id"])
+        gap = self.conn.execute("SELECT * FROM part_gaps WHERE appeal_id=? ORDER BY id", (row["id"],)).fetchall()
+        history = [dict(h) for h in self.conn.execute(
+            "SELECT id,status,decided_by,decided_at,decision_note,gap_id FROM repair_appeals WHERE repair_id=? ORDER BY id", (row["repair_id"],))]
+        return {"id": row["id"], "repair_id": row["repair_id"], "recall_id": row["recall_id"],
+                "vin": vehicle["vin"], "dealer": {"id": dealer["id"], "code": dealer["code"], "name": dealer["name"], "country": dealer["country"]},
+                "new_evidence_hash": row["new_evidence_hash"], "explanation": row["explanation"],
+                "status": row["status"], "submitted_by": row["submitted_by"], "submitted_at": row["submitted_at"],
+                "decided_by": row["decided_by"], "decided_at": row["decided_at"], "decision_note": row["decision_note"],
+                "original_repair": {"id": repair["id"], "status": repair["status"], "evidence_hash": repair["evidence_hash"],
+                                    "evidence_consistent": bool(repair["evidence_consistent"]),
+                                    "reported_by": repair["reported_by"], "reported_at": repair["reported_at"],
+                                    "reviewed_by": repair["reviewed_by"], "reviewed_at": repair["reviewed_at"], "review_note": repair["review_note"]},
+                "appeal_history": history,
+                "part_gaps": [{"id": g["id"], "quantity": g["quantity"], "original_quantity": g["original_quantity"],
+                               "status": g["status"], "created_at": g["created_at"], "recovered_at": g["recovered_at"]} for g in gap]}
+
+    def _gap_dict(self, row: sqlite3.Row) -> dict:
+        return {"id": row["id"], "recall_id": row["recall_id"], "dealer_id": row["dealer_id"], "remedy_version": row["remedy_version"],
+                "repair_id": row["repair_id"], "appeal_id": row["appeal_id"], "quantity": row["quantity"],
+                "original_quantity": row["original_quantity"], "status": row["status"],
+                "created_by": row["created_by"], "created_at": row["created_at"], "recovered_at": row["recovered_at"]}
+
+    def _inventory_status(self) -> dict:
+        dealers = []
+        for dealer in self.conn.execute("SELECT * FROM dealers ORDER BY id"):
+            parts = [dict(p) for p in self.conn.execute(
+                "SELECT * FROM parts WHERE dealer_id=? ORDER BY recall_id,remedy_version", (dealer["id"],))]
+            gaps = [self._gap_dict(g) for g in self.conn.execute(
+                "SELECT * FROM part_gaps WHERE dealer_id=? ORDER BY id", (dealer["id"],))]
+            open_gaps = [g for g in gaps if g["status"] == "open"]
+            dealers.append({"dealer_id": dealer["id"], "code": dealer["code"], "name": dealer["name"], "country": dealer["country"],
+                            "active": bool(dealer["active"]), "new_repairs_suspended": bool(open_gaps),
+                            "parts": parts, "open_gap_quantity": sum(g["quantity"] for g in open_gaps),
+                            "part_gaps": gaps})
+        return {"dealers": dealers}
 
     def _create_release_artifacts(self, recall_id: int, scope_version: int, actor: str) -> None:
         recall = self._row("recalls", recall_id); scope = json.loads(recall["scope_json"])
@@ -317,6 +491,8 @@ class RecallService:
         return {"dealers": [dict(row) for row in self.conn.execute("SELECT * FROM dealers ORDER BY id")],
                 "vehicles": [dict(row) for row in self.conn.execute("SELECT * FROM vehicles ORDER BY id")],
                 "recalls": [self._recall_dict(row) for row in self.conn.execute("SELECT * FROM recalls ORDER BY id DESC")],
+                "repair_appeals": [dict(row) for row in self.conn.execute("SELECT * FROM repair_appeals ORDER BY id")],
+                "part_gaps": [dict(row) for row in self.conn.execute("SELECT * FROM part_gaps ORDER BY id")],
                 "audits": [dict(row) for row in self.conn.execute("SELECT * FROM audit_log ORDER BY id DESC LIMIT 30")]}
 
     def seed(self) -> None:
@@ -346,11 +522,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         try:
             p = self._parts()
+            status_filter = parse_qs(urlparse(self.path).query).get("status", [""])[0]
             if p in (["health"], ["api", "health"]): out = {"status": "ok"}
             elif p == ["api", "state"]: out = self.service.state()
+            elif p == ["api", "appeals"]:
+                out = self.service.appeals_archive(self.headers.get("X-Actor"), self.headers.get("X-Role"), status_filter)
             elif len(p) == 3 and p[:2] == ["api", "recalls"]: out = self.service.recall_detail(int(p[2]))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "unfinished":
                 out = self.service.unfinished(self.headers.get("X-Actor"), self.headers.get("X-Role"), int(p[2]))
+            elif p in (["appeals"], ["appeals.html"]):
+                page = (Path(__file__).parent / "static" / "appeals.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
@@ -371,6 +552,8 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "parts": out = self.service.add_parts(actor, role, int(p[2]), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), int(body.get("quantity", 0)))
             elif p == ["api", "repairs"]: out = self.service.report_repair(actor, role, int(body.get("recall_id", 0)), body.get("vin", ""), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), body.get("evidence_hash", ""), bool(body.get("evidence_consistent", True)), body.get("border_permit", ""), body.get("idempotency_key", ""))
             elif len(p) == 4 and p[:2] == ["api", "repairs"] and p[3] == "review": out = self.service.review_repair(actor, role, int(p[2]), body.get("decision", ""), body.get("note", ""))
+            elif p == ["api", "appeals"]: out = self.service.submit_appeal(actor, role, int(body.get("repair_id", 0)), body.get("new_evidence_hash", ""), body.get("explanation", ""))
+            elif len(p) == 4 and p[:2] == ["api", "appeals"] and p[3] == "decision": out = self.service.decide_appeal(actor, role, int(p[2]), body.get("decision", ""), body.get("note", ""))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})

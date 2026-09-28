@@ -1,0 +1,111 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>打回申诉处理</title>
+<style>
+body{font:15px system-ui;margin:0;background:#f5f6f8;color:#1f2933}
+header{background:#1f3a5f;color:#fff;padding:14px 24px;display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+header a{color:#cfe0ff}
+main{max-width:1280px;margin:20px auto;padding:0 16px}
+.identity{margin-left:auto;display:flex;gap:8px;align-items:center}
+.identity input,.identity select{padding:6px}
+.cols{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+@media(max-width:1000px){.cols{grid-template-columns:1fr}}
+h2{font-size:16px;margin:18px 0 8px}
+.count{display:inline-block;min-width:20px;padding:1px 8px;border-radius:10px;background:#dce4ee;text-align:center;font-size:13px}
+.card{background:#fff;border:1px solid #dfe3e8;border-radius:8px;padding:12px 14px;margin-bottom:12px}
+.card h3{margin:0 0 6px;font-size:15px}
+.meta{color:#5b6b7b;font-size:13px;line-height:1.7}
+.tag{display:inline-block;padding:1px 8px;border-radius:4px;font-size:12px;margin-right:6px}
+.tag.pending{background:#fff3cd}.tag.upheld{background:#f8d7da}.tag.overturned{background:#d4edda}
+.suspended{color:#a94442;font-weight:600}
+.ok{color:#2f7d32}
+details{margin-top:8px}
+summary{cursor:pointer;color:#345995;font-size:13px}
+pre{background:#f3f5f7;padding:10px;border-radius:6px;overflow:auto;font-size:12px;max-height:260px}
+textarea,input{width:100%;box-sizing:border-box;padding:6px;margin:4px 0;font:inherit}
+button{padding:6px 12px;margin-right:6px;cursor:pointer}
+.actions{margin-top:8px}
+.submit-form{background:#fff;border:1px solid #dfe3e8;border-radius:8px;padding:12px 14px;margin-bottom:14px}
+.inv{background:#fff;border:1px solid #dfe3e8;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-size:13px}
+.inv table{border-collapse:collapse;width:100%}
+.inv th,.inv td{border:1px solid #e4e7eb;padding:4px 8px;text-align:left}
+.msg{color:#a94442;min-height:18px;font-size:13px}
+</style>
+<header>
+  <strong>打回申诉处理台</strong>
+  <a href="/">← 返回召回跟踪主页</a>
+  <div class="identity">
+    身份 <input id="actor" value="reg" size="10">
+    角色 <select id="role"><option value="regulator">regulator 监管</option><option value="dealer">dealer 网点</option><option value="manufacturer">manufacturer 厂商</option></select>
+    <button onclick="load()">刷新</button>
+  </div>
+</header>
+<main>
+  <p class="meta">网点按原维修单提交一次申诉并附新证据与说明，同单仅一份待审；监管维持打回时原单继续作废，改判通过时原维修恢复完成。若退回零件已被其他车辆领走，将记录库存缺口并暂停该网点新维修，补货后自动恢复。</p>
+  <div class="submit-form">
+    <strong>网点提交申诉</strong>
+    <div class="msg" id="submitMsg"></div>
+    原维修单 ID <input id="repairId" size="8" placeholder="repairs.id">
+    新证据哈希 <input id="evidence" placeholder="新证据文件哈希">
+    申诉说明 <textarea id="explanation" rows="2" placeholder="新证据说明"></textarea>
+    <button onclick="submitAppeal()">提交申诉</button>
+  </div>
+  <div class="inv"><strong>当前库存状态</strong><div id="inventory"></div></div>
+  <div class="msg" id="decideMsg"></div>
+  <div class="cols">
+    <section><h2>待审 <span class="count" id="c-pending">0</span></h2><div id="pending"></div></section>
+    <section><h2>维持打回 <span class="count" id="c-upheld">0</span></h2><div id="upheld"></div></section>
+    <section><h2>改判通过 <span class="count" id="c-overturned">0</span></h2><div id="overturned"></div></section>
+  </div>
+</main>
+<script>
+const labels={pending:'待审',upheld:'维持打回',overturned:'改判通过'};
+async function api(path,opts){const r=await fetch(path,Object.assign({headers:{'Content-Type':'application/json','X-Actor':actor.value,'X-Role':role.value}},opts));return {ok:r.ok,body:await r.json()}}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function card(a){
+  const note=a.decision_note?`<div>判定说明：${esc(a.decision_note)}（${esc(a.decided_by)} @ ${esc(a.decided_at)}）</div>`:'';
+  const gaps=a.part_gaps&&a.part_gaps.length?`<div class="${a.part_gaps.some(g=>g.status==='open')?'suspended':'ok'}">库存缺口：${a.part_gaps.map(g=>`#${g.id} ${g.original_quantity}件 剩余${g.quantity} ${g.status==='open'?'待补':'已于'+esc(g.recovered_at)+'补齐'}`).join('；')}</div>`:'';
+  const actions=a.status==='pending'?`<div class="actions">说明 <input id="note-${a.id}" placeholder="判定说明（可选）">
+      <button onclick="decide(${a.id},'uphold')">维持打回</button>
+      <button onclick="decide(${a.id},'overturn')">改判通过</button></div>`:'';
+  return `<div class="card"><h3>申诉 #${a.id} ｜ 维修单 #${a.repair_id} ｜ ${esc(a.vin)}</h3>
+    <div class="meta">
+      <span class="tag ${a.status}">${labels[a.status]}</span>网点 ${esc(a.dealer.code)} ${esc(a.dealer.name)}（${esc(a.dealer.country)}）
+      <div>提交：${esc(a.submitted_by)} @ ${esc(a.submitted_at)}</div>
+      <div>原证据：${esc(a.original_repair.evidence_hash)}（${a.original_repair.evidence_consistent?'一致':'不一致'}），监管打回：${esc(a.original_repair.review_note||'')}</div>
+      <div>原维修状态：<strong>${esc(a.original_repair.status)}</strong>（上报 ${esc(a.original_repair.reported_at)}，复核 ${esc(a.original_repair.reviewed_at)||'-'}）</div>
+      <div>新证据：${esc(a.new_evidence_hash)}</div><div>说明：${esc(a.explanation)}</div>${note}${gaps}
+      <details><summary>该维修单全部处理记录（${a.appeal_history.length} 次申诉）</summary><pre>${esc(JSON.stringify(a.appeal_history,null,2))}</pre></details>
+      ${actions}
+    </div></div>`
+}
+async function load(){
+  const {body}=await api('/api/appeals');
+  for(const s of ['pending','upheld','overturned']){
+    document.getElementById('c-'+s).textContent=body[s].length;
+    document.getElementById(s).innerHTML=body[s].map(card).join('')||'<p class="meta">（无）</p>';
+  }
+  renderInventory(body.inventory);
+}
+function renderInventory(inv){
+  if(!inv){document.getElementById('inventory').textContent='';return}
+  let rows='';
+  for(const d of inv.dealers){
+    const parts=d.parts.map(p=>`召回#${p.recall_id}/方案v${p.remedy_version}：${p.available}件`).join('；')||'无库存';
+    rows+=`<tr><td>${esc(d.code)} ${esc(d.name)}</td><td>${parts}</td><td>${d.open_gap_quantity}</td><td>${d.new_repairs_suspended?'<span class="suspended">已暂停新维修</span>':'<span class="ok">正常</span>'}</td></tr>`;
+  }
+  document.getElementById('inventory').innerHTML=`<table><tr><th>网点</th><th>可用库存</th><th>待补缺口</th><th>新维修</th></tr>${rows}</table>`;
+}
+async function submitAppeal(){
+  const m=document.getElementById('submitMsg');
+  const {ok,body}=await api('/api/appeals',{method:'POST',body:JSON.stringify({repair_id:Number(repairId.value),new_evidence_hash:evidence.value,explanation:explanation.value})});
+  m.textContent=ok?'':'提交失败：'+(body.error||'未知错误');
+  if(ok){repairId.value='';evidence.value='';explanation.value='';load()}
+}
+async function decide(id,decision){
+  const m=document.getElementById('decideMsg');
+  const note=document.getElementById('note-'+id).value;
+  const {ok,body}=await api(`/api/appeals/${id}/decision`,{method:'POST',body:JSON.stringify({decision,note})});
+  m.textContent=ok?'':'判定失败：'+(body.error||'未知错误');
+  if(ok)load();
+}
+load();
+</script></html>
