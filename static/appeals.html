@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>打回申诉 - 车辆召回跟踪</title>
+<style>
+body{font:15px system-ui;max-width:1280px;margin:28px auto;padding:0 20px;color:#1f2933}
+a{color:#2b6cb0}
+.bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+.bar input,.bar select{padding:6px 8px;border:1px solid #cbd2d9;border-radius:4px}
+button{padding:7px 14px;border:0;border-radius:4px;background:#2b6cb0;color:#fff;cursor:pointer}
+button.ghost{background:#e4e7eb;color:#1f2933}
+button.danger{background:#c53030}
+button.ok{background:#2f855a}
+.columns{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}
+h2{font-size:16px;border-bottom:2px solid #e4e7eb;padding-bottom:6px}
+.card{border:1px solid #cbd2d9;border-radius:8px;padding:12px;margin-bottom:12px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.card.suspended{border-color:#c53030;background:#fff5f5}
+.kv{font-size:13px;margin:2px 0}
+.kv b{color:#52606d;font-weight:600}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff}
+.b-pending{background:#b7791f}.b-upheld{background:#c53030}.b-reversed{background:#2f855a}.b-flagged{background:#c53030}.b-confirmed{background:#2f855a}.b-superseded{background:#718096}
+details{margin-top:6px}
+summary{cursor:pointer;font-size:13px;color:#2b6cb0}
+ol{margin:6px 0;padding-left:20px;font-size:12.5px}
+textarea,input{width:100%;box-sizing:border-box;margin:4px 0;padding:6px;border:1px solid #cbd2d9;border-radius:4px}
+.small{font-size:12px;color:#7b8794}
+pre{font-size:12px;white-space:pre-wrap;word-break:break-all;margin:4px 0}
+</style>
+</head>
+<body>
+<h1>打回申诉</h1>
+<p class="small">网点按原维修单提交申诉（附新证据与说明，同一单仅一份待审）；监管维持打回则原单继续作废，改判通过则原维修恢复完成。回退零件被其他车辆领走时登记库存缺口并暂停该网点新维修，补货填平后自动恢复。<a href="/">← 返回总览</a></p>
+<div class="bar">
+  身份
+  <select id="actor">
+    <option value="dealer">网点 dealer</option>
+    <option value="regulator">监管 regulator</option>
+    <option value="manufacturer">厂家 manufacturer</option>
+  </select>
+  <input id="actorName" placeholder="X-Actor 名称" value="dealer-demo" style="width:160px">
+  <button class="ghost" onclick="load()">刷新</button>
+</div>
+<div class="bar">
+  <input id="repairId" type="number" placeholder="原维修单 ID" style="width:130px">
+  <input id="evidence" placeholder="新证据哈希（必填）" style="width:220px">
+  <input id="explanation" placeholder="情况说明（必填）" style="flex:1;min-width:220px">
+  <button onclick="submitAppeal()">提交申诉</button>
+</div>
+<div id="msg" class="small"></div>
+<div class="columns">
+  <div><h2>待审 <span id="c-pending" class="badge b-pending">0</span></h2><div id="g-pending"></div></div>
+  <div><h2>维持 <span id="c-upheld" class="badge b-upheld">0</span></h2><div id="g-upheld"></div></div>
+  <div><h2>改判 <span id="c-reversed" class="badge b-reversed">0</span></h2><div id="g-reversed"></div></div>
+</div>
+
+<script>
+const HEAD = () => ({'Content-Type':'application/json','X-Actor':actorName.value,'X-Role':actor.value});
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function msg(t, err){const el=document.getElementById('msg');el.textContent=t;el.style.color=err?'#c53030':'#2f855a';setTimeout(()=>el.textContent='',4000)}
+
+async function load(){
+  const r = await fetch('/api/appeals', {headers:HEAD()});
+  const body = await r.json();
+  if(!r.ok){document.querySelectorAll('[id^=g-]').forEach(e=>e.innerHTML='<pre>'+esc(body.error||'加载失败')+'</pre>');return}
+  for(const k of ['pending','upheld','reversed']){
+    document.getElementById('c-'+k).textContent = body[k].length;
+    document.getElementById('g-'+k).innerHTML = body[k].map(card).join('') || '<p class="small">（无）</p>';
+  }
+}
+
+function card(d){
+  const a=d.appeal, r=d.repair, v=d.vehicle||{}, inv=d.inventory;
+  const suspended = !inv.dealer_active || inv.open_gap_quantity>0;
+  return `<div class="card${suspended?' suspended':''}">
+    <div class="kv"><span class="badge b-${a.status}">${({pending:'待审',upheld:'维持',reversed:'改判'})[a.status]}</span>
+      <b>申诉 #${a.id}</b> · 原维修单 #${r.id} <span class="badge b-${r.status}">${({reported:'已报告',confirmed:'已完成',flagged:'已打回',superseded:'被取代'})[r.status]}</span></div>
+    <div class="kv"><b>车辆：</b>${esc(v.vin)} ${esc(v.model)} ${esc(v.model_year)}</div>
+    <div class="kv"><b>网点：</b>#${r.dealer_id} ${suspended?'<span style="color:#c53030">已暂停新维修</span>':'<span style="color:#2f855a">可接单</span>'}</div>
+    <div class="kv"><b>新证据：</b><pre>${esc(a.new_evidence_hash)}</pre></div>
+    <div class="kv"><b>说明：</b>${esc(a.explanation)}</div>
+    <div class="kv"><b>提交：</b>${esc(a.submitted_by)} @ ${esc(a.submitted_at)}</div>
+    ${a.decided_at?`<div class="kv"><b>判定：</b>${esc(a.decided_by)} @ ${esc(a.decided_at)} — ${esc(a.decision_note||'（无说明）')}</div>`:''}
+    <details><summary>原维修与处理流水（${d.events.length} 次处理）</summary>
+      <div class="small">原证据哈希：<pre>${esc(r.evidence_hash)}</pre>原复核备注：${esc(r.review_note||'（无）')} · 报告于 ${esc(r.reported_at)}</div>
+      <ol>${d.events.map(e=>`<li>${esc(e.at)} <b>${esc(e.actor)}</b> ${esc(e.action)}<pre>${esc(e.details_json)}</pre></li>`).join('')}</ol>
+    </details>
+    <details><summary>当前库存状态</summary>
+      <div class="small">可用 ${inv.available} · 未结缺口 ${inv.open_gap_quantity}</div>
+      <pre>${esc(JSON.stringify(inv.open_gaps,null,2))}</pre>
+    </details>
+    ${a.status==='pending'?`
+      <textarea id="note-${a.id}" placeholder="判定说明（可选）"></textarea>
+      <button class="danger" onclick="decide(${a.id},'uphold')">维持打回</button>
+      <button class="ok" onclick="decide(${a.id},'reverse')">改判通过</button>`:''}
+  </div>`;
+}
+
+async function submitAppeal(){
+  const payload = {repair_id:Number(repairId.value), new_evidence_hash:evidence.value, explanation:explanation.value};
+  const r = await fetch('/api/appeals',{method:'POST',headers:HEAD(),body:JSON.stringify(payload)});
+  const body = await r.json();
+  if(!r.ok) return msg(body.error||'提交失败',true);
+  evidence.value=explanation.value=repairId.value='';
+  msg('申诉已提交，等待监管判定');load();
+}
+
+async function decide(id, decision){
+  const note = document.getElementById('note-'+id).value;
+  const r = await fetch(`/api/appeals/${id}/decision`,{method:'POST',headers:HEAD(),body:JSON.stringify({decision,note})});
+  const body = await r.json();
+  if(!r.ok) return msg(body.error||'判定失败',true);
+  msg(`已${decision==='uphold'?'维持打回':'改判通过'}：${body.appeal.status}`);load();
+}
+document.getElementById('actor').addEventListener('change', e=>{actorName.value=e.target.value+'-demo'});
+load();
+</script>
+</body>
+</html>

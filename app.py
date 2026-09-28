@@ -12,6 +12,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from errors import ApiError
+from records import AppealArchive
+
 DB_PATH = Path(__file__).with_name("data.db")
 
 
@@ -21,11 +24,6 @@ def now() -> str:
 
 def j(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
-
-
-class ApiError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message); self.status, self.message = status, message
 
 
 class Store:
@@ -68,7 +66,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS repairs (
           id INTEGER PRIMARY KEY AUTOINCREMENT, recall_id INTEGER NOT NULL REFERENCES recalls(id),
           vehicle_id INTEGER NOT NULL REFERENCES vehicles(id), dealer_id INTEGER NOT NULL REFERENCES dealers(id),
-          remedy_version INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('reported','confirmed','flagged')),
+          remedy_version INTEGER NOT NULL, status TEXT NOT NULL CHECK(status IN ('reported','confirmed','flagged','superseded')),
           evidence_hash TEXT NOT NULL, evidence_consistent INTEGER NOT NULL, cross_border INTEGER NOT NULL DEFAULT 0,
           border_permit TEXT, idempotency_key TEXT NOT NULL, reported_by TEXT NOT NULL,
           reported_at TEXT NOT NULL, reviewed_by TEXT, reviewed_at TEXT, review_note TEXT,
@@ -90,6 +88,7 @@ class Store:
           id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL,
           entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, details_json TEXT NOT NULL
         );
+        """ + AppealArchive.SCHEMA + """
         """)
         self.conn.commit()
 
@@ -102,8 +101,9 @@ class Store:
 
 
 class RecallService:
-    def __init__(self, store: Store):
+    def __init__(self, store: Store, appeal_service: "AppealService | None" = None):  # noqa: F821
         self.store, self.conn = store, store.conn
+        self.appeals = appeal_service
 
     @staticmethod
     def _actor(actor: str | None, role: str | None, allowed: set[str]) -> str:
@@ -215,13 +215,17 @@ class RecallService:
         if quantity <= 0: raise ApiError(400, "入库数量必须大于零")
         recall = self._row("recalls", recall_id); dealer = self._row("dealers", dealer_id)
         if recall["state"] not in {"published", "submitted"}: raise ApiError(409, "召回尚未进入可备件状态")
+        # 补货优先填平该网点未结清的零件缺口；缺口清零时网点自动恢复新维修
+        gap_filled = self.appeals.reserve_restock_for_gaps(recall_id, dealer_id, remedy_version, quantity) if self.appeals else 0
+        remaining = quantity - gap_filled
         with self.conn:
-            self.conn.execute("""INSERT INTO parts(recall_id,dealer_id,remedy_version,available) VALUES(?,?,?,?)
-                               ON CONFLICT(recall_id,dealer_id,remedy_version) DO UPDATE SET available=available+excluded.available""",
-                              (recall_id, dealer_id, remedy_version, quantity))
-            self.store.audit(actor, "parts.add", "recall", recall_id, {"dealer_id": dealer_id, "quantity": quantity, "remedy_version": remedy_version})
+            if remaining > 0:
+                self.conn.execute("""INSERT INTO parts(recall_id,dealer_id,remedy_version,available) VALUES(?,?,?,?)
+                                   ON CONFLICT(recall_id,dealer_id,remedy_version) DO UPDATE SET available=available+excluded.available""",
+                                  (recall_id, dealer_id, remedy_version, remaining))
+            self.store.audit(actor, "parts.add", "recall", recall_id, {"dealer_id": dealer_id, "quantity": quantity, "remedy_version": remedy_version, "gap_filled": gap_filled})
         row = self.conn.execute("SELECT * FROM parts WHERE recall_id=? AND dealer_id=? AND remedy_version=?", (recall_id, dealer_id, remedy_version)).fetchone()
-        return dict(row)
+        return {"gap_filled": gap_filled, "available": int(row["available"]) if row else 0}
 
     def report_repair(self, actor: str | None, role: str | None, recall_id: int, vin: str, dealer_id: int, remedy_version: int, evidence_hash: str, evidence_consistent: bool, border_permit: str = "", idempotency_key: str = "") -> dict:
         actor = self._actor(actor, role, {"dealer"})
@@ -329,6 +333,7 @@ class RecallService:
 
 class Handler(BaseHTTPRequestHandler):
     service: RecallService
+    appeals: "AppealService"  # noqa: F821
 
     def log_message(self, fmt: str, *args: object) -> None: sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
 
@@ -351,8 +356,14 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 3 and p[:2] == ["api", "recalls"]: out = self.service.recall_detail(int(p[2]))
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "unfinished":
                 out = self.service.unfinished(self.headers.get("X-Actor"), self.headers.get("X-Role"), int(p[2]))
+            elif p == ["api", "appeals"]:
+                out = self.appeals.grouped(self.headers.get("X-Actor"), self.headers.get("X-Role"))
+            elif len(p) == 3 and p[:2] == ["api", "appeals"]:
+                out = self.appeals.dossier(int(p[2]))
             elif not p:
                 page = (Path(__file__).parent / "static" / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
+            elif p == ["appeals"]:
+                page = (Path(__file__).parent / "static" / "appeals.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(page))); self.end_headers(); self.wfile.write(page); return
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
@@ -371,6 +382,8 @@ class Handler(BaseHTTPRequestHandler):
             elif len(p) == 4 and p[:2] == ["api", "recalls"] and p[3] == "parts": out = self.service.add_parts(actor, role, int(p[2]), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), int(body.get("quantity", 0)))
             elif p == ["api", "repairs"]: out = self.service.report_repair(actor, role, int(body.get("recall_id", 0)), body.get("vin", ""), int(body.get("dealer_id", 0)), int(body.get("remedy_version", 0)), body.get("evidence_hash", ""), bool(body.get("evidence_consistent", True)), body.get("border_permit", ""), body.get("idempotency_key", ""))
             elif len(p) == 4 and p[:2] == ["api", "repairs"] and p[3] == "review": out = self.service.review_repair(actor, role, int(p[2]), body.get("decision", ""), body.get("note", ""))
+            elif p == ["api", "appeals"]: out = self.appeals.submit_appeal(actor, role, int(body.get("repair_id", 0)), body.get("new_evidence_hash", ""), body.get("explanation", ""))
+            elif len(p) == 4 and p[:2] == ["api", "appeals"] and p[3] == "decision": out = self.appeals.decide_appeal(actor, role, int(p[2]), body.get("decision", ""), body.get("note", ""))
             else: raise ApiError(404, "接口不存在")
             self._send(200, out)
         except ApiError as exc: self._send(exc.status, {"error": exc.message})
@@ -379,9 +392,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run(port: int, db_path: str, seed: bool) -> None:
-    store = Store(db_path); service = RecallService(store)
+    store = Store(db_path)
+    from appeals import AppealService
+    appeals = AppealService(store)
+    service = RecallService(store, appeals)
     if seed: service.seed()
     Handler.service = service
+    Handler.appeals = appeals
     print(f"vehicle recall listening on http://127.0.0.1:{port}")
     ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
